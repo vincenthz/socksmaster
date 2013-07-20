@@ -1,0 +1,30 @@
+Name:                socksmaster
+Version:             0.1
+Synopsis:            Socks Master
+Description:         Socks Master
+License:             BSD3
+License-file:        LICENSE
+Author:              Vincent Hanquez
+Maintainer:          vincent@snarc.org
+Category:            Network
+Build-Type:          Simple
+Cabal-Version:       >=1.6
+
+Executable socksmaster
+  hs-source-dirs:    Src
+  Main-Is:           Main.hs
+  Build-depends:     base >= 3 && < 5
+                   , mtl
+                   , network
+                   , directory
+                   , filepath
+                   , bytestring
+                   , certificate
+                   , hashable
+                   , hashtables
+                   , time
+                   , old-locale
+                   , unix
+                   , socks >= 0.5
+  ghc-options:       -Wall -fno-warn-missing-signatures
+  Buildable:         True
