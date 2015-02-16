@@ -2,15 +2,13 @@ module SocketTable where
 
 import Control.Monad
 import Control.Applicative
-import Data.Time.Clock
-import Data.Time.Format
 import Control.Concurrent.MVar
-import System.Locale
 import Network.Socket (Socket, getPeerName, fdSocket, sClose)
 import Data.Hashable
 import qualified Control.Exception as E
 import qualified Data.HashTable.IO as H
-
+import Data.Hourglass
+import System.Hourglass
 
 type HashTable k v = H.BasicHashTable k v
 
@@ -18,9 +16,9 @@ data Type = Listen | Client | Provider
     deriving (Show,Eq)
 
 data SocketLog = SocketLog
-    { socketOpenTime  :: {-# UNPACK #-} !UTCTime
+    { socketOpenTime  :: {-# UNPACK #-} !ElapsedP
     , socketType      :: !Type
-    , socketUsed      :: MVar (UTCTime, UTCTime)
+    , socketUsed      :: MVar (ElapsedP, ElapsedP)
     }
 
 instance Hashable Socket where
@@ -37,7 +35,7 @@ data SocketTable = SocketTable (HashTable Socket SocketLog)
 newSocketTable = SocketTable <$> H.new
 
 insertSocketTable (SocketTable h) socket ty = do
-    c <- getCurrentTime
+    c <- timeCurrentP
     u <- newMVar (c,c)
     H.insert h socket (SocketLog c ty u)
 
@@ -46,11 +44,11 @@ deleteSocketTable (SocketTable h) socket =
 
 withSocket (SocketTable h) socket f = do
     socketlog <- maybe (error ("socket cannot be found")) id <$> H.lookup h socket
-    c <- getCurrentTime
+    c <- timeCurrentP
     modifyMVar_ (socketUsed socketlog) $ \(_,e) -> return (c,e)
     r <- f
-    c <- getCurrentTime
-    modifyMVar_ (socketUsed socketlog) $ \(s,_) -> return (s,c)
+    c2 <- timeCurrentP
+    modifyMVar_ (socketUsed socketlog) $ \(s,_) -> return (s,c2)
     return r
 
 closeSocket st socket = sClose socket >> deleteSocketTable st socket
@@ -66,5 +64,7 @@ dumpSocketTable (SocketTable h) = putStrLn (replicate 80 '=') >> (H.toList h >>=
           errTostr :: E.SomeException -> String
           errTostr e = show e
 
-          showTime :: UTCTime -> String
-          showTime t = formatTime defaultTimeLocale "%c" t
+          showTime :: ElapsedP -> String
+          showTime t = timePrint [Format_Year,dash,Format_Month2,dash,Format_Day2,Format_Hour,colon,Format_Minute,colon,Format_Second] t
+            where colon = Format_Text ':'
+                  dash  = Format_Text '-'

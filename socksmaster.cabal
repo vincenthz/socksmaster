@@ -19,11 +19,9 @@ Executable socksmaster
                    , directory
                    , filepath
                    , bytestring
-                   , certificate
                    , hashable
                    , hashtables
-                   , time
-                   , old-locale
+                   , hourglass
                    , unix
                    , socks >= 0.5
   ghc-options:       -Wall -fno-warn-missing-signatures
