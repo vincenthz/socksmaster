@@ -269,7 +269,7 @@ options =
 usage = putStrLn (usageInfo "usage: socksmaster [-l <port>] <name>" options)
 
 main = do
-    userDataDir <- getAppUserDataDirectory "sockmaster"
+    userDataDir <- getAppUserDataDirectory "socksmaster"
     let userDataFile = userDataDir </> "config"
     exists  <- doesDirectoryExist userDataDir
     exists2 <- doesFileExist userDataFile
