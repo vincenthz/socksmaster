@@ -27,22 +27,27 @@ instance Hashable Socket where
                           fdSocketInt = fromIntegral . fdSocket
         
 
-data SocketTable = SocketTable (HashTable Socket SocketLog)
+data SocketTable = SocketTable
+    (HashTable Socket SocketLog)
+    (MVar Int)
+    (MVar Int)
 
 -- 7.6.2
 --modifyIORef'
 
 newSocketTable = SocketTable <$> H.new
+                             <*> newMVar 0
+                             <*> newMVar 0
 
-insertSocketTable (SocketTable h) socket ty = do
+insertSocketTable (SocketTable h _ _) socket ty = do
     c <- timeCurrentP
     u <- newMVar (c,c)
     H.insert h socket (SocketLog c ty u)
 
-deleteSocketTable (SocketTable h) socket =
+deleteSocketTable (SocketTable h _ _) socket =
     H.delete h socket
 
-withSocket (SocketTable h) socket f = do
+withSocket (SocketTable h _ _) socket f = do
     socketlog <- maybe (error ("socket cannot be found")) id <$> H.lookup h socket
     c <- timeCurrentP
     modifyMVar_ (socketUsed socketlog) $ \(_,e) -> return (c,e)
@@ -51,9 +56,20 @@ withSocket (SocketTable h) socket f = do
     modifyMVar_ (socketUsed socketlog) $ \(s,_) -> return (s,c2)
     return r
 
+socketHasRead (SocketTable _ _ r) socket n =
+    modifyMVar_ r (\v -> return (v + n))
+
+socketHasWritten (SocketTable _ w _) socket n =
+    modifyMVar_ w (\v -> return (v + n))
+
+socketDumpSpeed (SocketTable _ w r) = do
+    modifyMVar r $ \rv -> do
+        z <- modifyMVar w $ \wv -> return (0, wv)
+        return (0, (z, rv))
+
 closeSocket st socket = sClose socket >> deleteSocketTable st socket
 
-dumpSocketTable (SocketTable h) = putStrLn (replicate 80 '=') >> (H.toList h >>= mapM_ printLine) >> putStrLn (replicate 80 '=')
+dumpSocketTable (SocketTable h _ _) = putStrLn (replicate 80 '=') >> (H.toList h >>= mapM_ printLine) >> putStrLn (replicate 80 '=')
     where printLine (socket, slog) = do
                 pn <- if socketType slog == Listen 
                         then return ""

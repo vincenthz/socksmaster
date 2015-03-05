@@ -19,11 +19,13 @@ import System.Posix.Signals
 import System.Exit
 import Control.Concurrent (forkIO, killThread)
 import Control.Concurrent.Chan
+import Control.Concurrent
 import Control.Exception (bracketOnError)
 import qualified Control.Exception as E
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
 import Data.Word
+import Text.Printf
 
 import qualified Data.ByteString as B
 
@@ -62,7 +64,9 @@ proxy st dir chan src dst = allocaBytesAligned bufSz 8 loop
             case eb of
                 Left (_:: E.SomeException) -> writeChan chan (dir, NotificationErrRead)
                 Right 0 -> writeChan chan (dir, NotificationReadFinished)
-                Right n -> do evoid <- sendBufAll buf n
+                Right n -> do
+                              when (dir == ClientToProvider) $ socketHasWritten st src n
+                              evoid <- sendBufAll buf n
                               case evoid of
                                   Left _   -> writeChan chan (dir, NotificationErrWrite)
                                   Right () -> loop buf
@@ -74,7 +78,9 @@ proxy st dir chan src dst = allocaBytesAligned bufSz 8 loop
                         esent <- E.try (sendBuf dst buf n)
                         case esent of
                             Left e     -> return (Left e)
-                            Right sent -> go (buf `plusPtr` sent) (n - sent)
+                            Right sent -> do
+                                when (dir == ProviderToClient) $ socketHasRead st dst sent
+                                go (buf `plusPtr` sent) (n - sent)
         bufSz = 16384
 
 doListen (PortNumber serv) = do
@@ -104,17 +110,17 @@ createLocalServer socksPort st chan = do
     sock <- doListen socksPort
     insertSocketTable st sock Listen
     forever $ loop sock
-    where loop sock = do
+  where loop sock = do
             (client,clientAddr) <- withSocket st sock (accept sock)
             insertSocketTable st client Client
             forkIO $ processClient client clientAddr
-          processClient clientSock clientAddr = do
+        processClient clientSock clientAddr = do
             req <- timeout 1000000 $ withSocket st clientSock (socksListen clientSock)
             case req of
                 Nothing -> logErrAddr clientAddr "timeout" >> closeSocket st clientSock
                 Just r  -> logAddr clientAddr (show (requestDstAddr r) ++ ":" ++ show (requestDstPort r)) >> writeChan chan (clientSock,clientAddr,r)
 
--- biproxy from 
+-- biproxy from
 biproxy st clientAddr sock sock2 = do
     chan  <- newChan
     cppid <- forkIO $ proxy st ClientToProvider chan sock sock2
@@ -136,7 +142,7 @@ biproxy st clientAddr sock sock2 = do
     logAddr clientAddr "closing"
     mapM_ (closeSocket st) [sock,sock2]
 
-replySocksError st sock err = 
+replySocksError st sock err =
     withSocket st sock $ sendSerialized sock (SocksResponse (SocksReplyError err) (SocksAddrIPV4 0) 0)
 
 -- | Connect a stream to an external SOCKS server.
@@ -209,7 +215,7 @@ providerFromRoute defaultRoute routes _ addr =
   where findPrefix [] _      = Nothing
         findPrefix ((r,p):rs) dn | B.isSuffixOf r dn = Just p
                                  | otherwise         = findPrefix rs dn
-        
+
 
 -- | Route a connection request to the proper provider.
 doConnect defaultRoute routes st clientAddr clientSock dstaddr port = do
@@ -246,12 +252,25 @@ mainListen cfg n o = withSocketsDo $ do
                     ListenAt p -> Just (fromIntegral $ read p)
                     _          -> Nothing) Nothing o
 
+    _ <- forkIO $ reportUsage st
+
     void $ forkIO $ createLocalServer pn st chan
     forever $ do
         (clientSock,clientAddr,req) <- readChan chan
         case requestCommand req of
             SocksCommandConnect -> doConnect def routes st clientAddr clientSock (requestDstAddr req) (requestDstPort req)
             _                   -> putStrLn "unsupported socks command" >> closeSocket st clientSock
+
+reportUsage st = forever $ do
+    threadDelay 1000000
+    (written, read) <- socketDumpSpeed st
+    when (written /= 0 || read /= 0) $
+        putStrLn ("written: " ++ toHU written ++ " read: " ++ toHU read)
+  where toHU :: Int -> String
+        toHU n
+            | n > 1 * 1024 * 1024 = printf "%.2f Mb/s" (fromIntegral n / (1024 * 1024) :: Double)
+            | n > 1 * 1024        = printf "%.2f Kb/s" (fromIntegral n / 1024 :: Double)
+            | otherwise           = printf "%f b/s" (fromIntegral n :: Double)
 
 data Flag = ListenAt String
           | AtWork
@@ -273,7 +292,7 @@ main = do
     let userDataFile = userDataDir </> "config"
     exists  <- doesDirectoryExist userDataDir
     exists2 <- doesFileExist userDataFile
-    
+
     when (not exists || not exists2) $ error "user configuration doesn't exists"
     cfg <- readConfig userDataFile
     --putStrLn $ show iniCfg
