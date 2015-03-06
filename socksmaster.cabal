@@ -23,6 +23,7 @@ Executable socksmaster
                    , hashtables
                    , hourglass
                    , unix
+                   , ansi-terminal
                    , socks >= 0.5
   ghc-options:       -Wall -fno-warn-missing-signatures -threaded
   Buildable:         True

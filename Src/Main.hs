@@ -25,6 +25,7 @@ import qualified Control.Exception as E
 import Foreign.Marshal.Alloc
 import Foreign.Ptr
 import Data.Word
+import Data.Hourglass
 import Text.Printf
 
 import qualified Data.ByteString as B
@@ -33,6 +34,10 @@ import qualified Data.ByteString as B
 
 import SocketTable
 import Config
+
+import System.Console.ANSI
+import System.IO
+import System.IO.Unsafe
 
 listenPortDefault = 2080
 
@@ -46,8 +51,50 @@ data NetHandler = NetHandler
     }
     deriving (Show,Eq)
 
-logErrAddr addr s = putStrLn ("[ERROR] " ++ show addr ++ ": " ++ s)
-logAddr addr s = putStrLn ("[ LOG ] " ++ show addr ++ ": " ++ s)
+terminalLock = unsafePerformIO $ newMVar ()
+{-# NOINLINE terminalLock #-}
+
+withTerminalLock :: IO () -> IO ()
+withTerminalLock f = modifyMVar_ terminalLock $ \() -> f >> return ()
+
+logErrAddr :: SockAddr -> String -> IO ()
+logErrAddr addr s = withTerminalLock $ do
+    hSetSGR stdout [SetColor Foreground Vivid Red]
+    hPutStr stdout "[ERROR] "
+    hSetSGR stdout [SetColor Foreground Vivid Green]
+    hPutStr stdout (show addr)
+    hSetSGR stdout []
+    hPutStrLn stdout (": " ++ s)
+
+logAddr :: SockAddr -> String -> IO ()
+logAddr addr s = withTerminalLock $ do
+    hSetSGR stdout [SetColor Foreground Vivid Blue]
+    hPutStr stdout "[ LOG ] "
+    hSetSGR stdout [SetColor Foreground Vivid Green]
+    hPutStr stdout (show addr)
+    hSetSGR stdout []
+    hPutStrLn stdout (": " ++ s)
+
+displaySpeed :: Int -> Int -> IO ()
+displaySpeed written recv = do
+    setTitle ("sent: " ++ toHU written ++ " recv: " ++ toHU recv)
+    when (written /= 0 || recv /= 0) $ withTerminalLock $ do
+        hSetSGR stdout [SetColor Foreground Vivid Yellow]
+        hPutStr stdout "## sent = "
+        hSetSGR stdout [SetColor Foreground Vivid Magenta]
+        hPutStr stdout (toHU written)
+        hSetSGR stdout [SetColor Foreground Vivid Yellow]
+        hPutStr stdout "   recv = "
+        hSetSGR stdout [SetColor Foreground Vivid Magenta]
+        hPutStr stdout (toHU recv)
+        hSetSGR stdout []
+        hPutStrLn stdout ""
+
+toHU :: Int -> String
+toHU n
+    | n > 1 * 1024 * 1024 = printf "%.2f Mb/s" (fromIntegral n / (1024 * 1024) :: Double)
+    | n > 1 * 1024        = printf "%.2f Kb/s" (fromIntegral n / 1024 :: Double)
+    | otherwise           = printf "%f b/s" (fromIntegral n :: Double)
 
 data Direction    = ClientToProvider
                   | ProviderToClient
@@ -117,16 +164,18 @@ createLocalServer socksPort st chan = do
         processClient clientSock clientAddr = do
             req <- timeout 1000000 $ withSocket st clientSock (socksListen clientSock)
             case req of
-                Nothing -> logErrAddr clientAddr "timeout" >> closeSocket st clientSock
-                Just r  -> logAddr clientAddr (show (requestDstAddr r) ++ ":" ++ show (requestDstPort r)) >> writeChan chan (clientSock,clientAddr,r)
+                Nothing -> logErrAddr clientAddr "timeout" >> closeSocket st clientSock >> return ()
+                Just r  -> do
+                    --logAddr clientAddr ("connection request for = " ++ show (requestDstAddr r) ++ ":" ++ show (requestDstPort r))
+                    writeChan chan (clientSock,clientAddr,r)
 
--- biproxy from
-biproxy st clientAddr sock sock2 = do
+-- biproxy from sock to sock2
+biproxy dstAddr st clientAddr sock sock2 = do
     chan  <- newChan
     cppid <- forkIO $ proxy st ClientToProvider chan sock sock2
     pcpid <- forkIO $ proxy st ProviderToClient chan sock2 sock
     (d,n) <- readChan chan
-    putStrLn (show clientAddr ++ " " ++ show d ++ " " ++ show n)
+    --putStrLn (show clientAddr ++ " " ++ show d ++ " " ++ show n)
     case n of
         NotificationErrRead  -> case d of
                                     ClientToProvider -> shutdown sock2 ShutdownSend >> killThread pcpid
@@ -138,9 +187,16 @@ biproxy st clientAddr sock sock2 = do
                                         ClientToProvider -> shutdown sock2 ShutdownSend >> killThread pcpid
                                         _                -> shutdown sock ShutdownSend >> killThread cppid
     (d2,n2) <- readChan chan
-    putStrLn (show clientAddr ++ " " ++ show d2 ++ " " ++ show n2)
-    logAddr clientAddr "closing"
-    mapM_ (closeSocket st) [sock,sock2]
+    --putStrLn (show clientAddr ++ " " ++ show d2 ++ " " ++ show n2)
+    [info,info2] <- mapM (closeSocket st) [sock,sock2]
+    case info of
+        Nothing -> logAddr clientAddr ("closing " ++ show dstAddr)
+        Just i  ->
+            let logS = printf "closing %s info: %s seconds sent=%s recv=%s"
+                            (show dstAddr)
+                            (show (socketLastUsed i `timeDiff` socketCreated i))
+                            (toHU $ socketSent i) (toHU $ socketRecv i)
+             in logAddr clientAddr logS
 
 replySocksError st sock err =
     withSocket st sock $ sendSerialized sock (SocksResponse (SocksReplyError err) (SocksAddrIPV4 0) 0)
@@ -152,9 +208,9 @@ doConnectProvider st (ProviderExternal socksHost socksPort) clientAddr clientSoc
     e <- E.try $ socksConnect socksConf (SocksAddress dstaddr port)
     case e of
         Left (exn :: E.SomeException)  -> do
-            logAddr clientAddr ("[External] connect to " ++ show dstaddr ++ ":" ++ show port ++ " provider failure: " ++ show exn)
+            logErrAddr clientAddr ("cannot connect to provider " ++ socksHost ++ ":" ++ show socksPort ++ " to get to " ++ show dstaddr)
             replySocksError st clientSock SocksErrorGeneralServerFailure
-            closeSocket st clientSock
+            _ <- closeSocket st clientSock
             return ()
         Right (provider, (serverBoundAddr, serverBoundPort)) -> do
             insertSocketTable st provider Provider
@@ -163,7 +219,7 @@ doConnectProvider st (ProviderExternal socksHost socksPort) clientAddr clientSoc
             sendSerialized clientSock (SocksResponse SocksReplySuccess serverBoundAddr serverBoundPort)
 
             -- loop for IO between socket
-            biproxy st clientAddr clientSock provider
+            biproxy dstaddr st clientAddr clientSock provider
 
 doConnectProvider st ProviderDirect clientAddr clientSock dstaddr port = do
     -- try to establish a direct connection
@@ -178,7 +234,8 @@ doConnectProvider st ProviderDirect clientAddr clientSock dstaddr port = do
         Left (e:: E.SomeException) -> do
             logAddr clientAddr ("[Direct] connect to " ++ show dstaddr ++ ":" ++ show port ++ " failed " ++ show e)
             replySocksError st clientSock SocksErrorHostUnreachable
-            closeSocket st clientSock
+            _ <- closeSocket st clientSock
+            return ()
         -- on success we establish a biproxy.
         Right providerSock -> do
             insertSocketTable st providerSock Provider
@@ -190,7 +247,7 @@ doConnectProvider st ProviderDirect clientAddr clientSock dstaddr port = do
                                     SockAddrUnix _                   -> error "sock addr unix"
             -- reply to the client that this has been successful.
             withSocket st clientSock $ sendSerialized clientSock (SocksResponse SocksReplySuccess sba sbp)
-            biproxy st clientAddr clientSock providerSock
+            biproxy dstaddr st clientAddr clientSock providerSock
     where
         getDestSockAddr = do
             case dstaddr of
@@ -202,7 +259,7 @@ doConnectProvider st ProviderDirect clientAddr clientSock dstaddr port = do
 doConnectProvider st ProviderNone clientAddr clientSock dstaddr port = do
     logAddr clientAddr ("[None] connect to " ++ show dstaddr ++ ":" ++ show port)
     replySocksError st clientSock SocksErrorHostUnreachable
-    closeSocket st clientSock
+    _ <- closeSocket st clientSock
     return ()
 
 providerFromRoute defaultRoute routes _ addr =
@@ -249,7 +306,7 @@ mainListen cfg n o = withSocketsDo $ do
     _ <- installHandler sigUSR1 handler Nothing
 
     let pn = PortNumber $ maybe listenPortDefault id $ foldl (\_ x -> case x of
-                    ListenAt p -> Just (fromIntegral $ read p)
+                    ListenAt p -> Just (fromIntegral $ (read p :: Integer))
                     _          -> Nothing) Nothing o
 
     _ <- forkIO $ reportUsage st
@@ -259,18 +316,12 @@ mainListen cfg n o = withSocketsDo $ do
         (clientSock,clientAddr,req) <- readChan chan
         case requestCommand req of
             SocksCommandConnect -> doConnect def routes st clientAddr clientSock (requestDstAddr req) (requestDstPort req)
-            _                   -> putStrLn "unsupported socks command" >> closeSocket st clientSock
+            _                   -> putStrLn "unsupported socks command" >> closeSocket st clientSock >> return ()
 
 reportUsage st = forever $ do
     threadDelay 1000000
-    (written, read) <- socketDumpSpeed st
-    when (written /= 0 || read /= 0) $
-        putStrLn ("written: " ++ toHU written ++ " read: " ++ toHU read)
-  where toHU :: Int -> String
-        toHU n
-            | n > 1 * 1024 * 1024 = printf "%.2f Mb/s" (fromIntegral n / (1024 * 1024) :: Double)
-            | n > 1 * 1024        = printf "%.2f Kb/s" (fromIntegral n / 1024 :: Double)
-            | otherwise           = printf "%f b/s" (fromIntegral n :: Double)
+    (writtenData, readData) <- socketDumpSpeed st
+    displaySpeed writtenData readData
 
 data Flag = ListenAt String
           | AtWork

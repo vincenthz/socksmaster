@@ -19,7 +19,26 @@ data SocketLog = SocketLog
     { socketOpenTime  :: {-# UNPACK #-} !ElapsedP
     , socketType      :: !Type
     , socketUsed      :: MVar (ElapsedP, ElapsedP)
+    , socketTraffic   :: MVar (Int, Int) -- (sent, received)
     }
+
+data SocketInfo = SocketInfo
+    { socketCreated  :: ElapsedP
+    , socketLastUsed :: ElapsedP
+    , socketSent     :: Int
+    , socketRecv     :: Int
+    } deriving (Show,Eq)
+
+socketLogToInfo :: SocketLog -> IO SocketInfo
+socketLogToInfo slog = do
+    lastUsed <- snd <$> readMVar (socketUsed slog)
+    (s,r)    <- readMVar (socketTraffic slog)
+    return $ SocketInfo
+        { socketCreated  = socketOpenTime slog
+        , socketLastUsed = lastUsed
+        , socketSent     = s
+        , socketRecv     = r
+        }
 
 instance Hashable Socket where
     hashWithSalt salt = hashWithSalt salt . fdSocketInt
@@ -40,12 +59,16 @@ newSocketTable = SocketTable <$> H.new
                              <*> newMVar 0
 
 insertSocketTable (SocketTable h _ _) socket ty = do
-    c <- timeCurrentP
-    u <- newMVar (c,c)
-    H.insert h socket (SocketLog c ty u)
+    currentTime <- timeCurrentP
+    lastUsed    <- newMVar (currentTime,currentTime)
+    traffic     <- newMVar (0,0)
+    H.insert h socket (SocketLog currentTime ty lastUsed traffic)
 
-deleteSocketTable (SocketTable h _ _) socket =
-    H.delete h socket
+deleteSocketTable (SocketTable h _ _) socket = do
+    r <- H.lookup h socket
+    case r of
+        Nothing   -> return Nothing
+        Just slog -> H.delete h socket >> (Just <$> socketLogToInfo slog)
 
 withSocket (SocketTable h _ _) socket f = do
     socketlog <- maybe (error ("socket cannot be found")) id <$> H.lookup h socket
@@ -56,12 +79,24 @@ withSocket (SocketTable h _ _) socket f = do
     modifyMVar_ (socketUsed socketlog) $ \(s,_) -> return (s,c2)
     return r
 
-socketHasRead (SocketTable _ _ r) socket n =
+onValidSocket :: SocketTable -> Socket -> (SocketLog -> IO ()) -> IO ()
+onValidSocket (SocketTable h _ _) socket f = do
+    mSocketLog <- H.lookup h socket
+    case mSocketLog of
+        Nothing        -> return ()
+        Just socketLog -> f socketLog
+
+socketHasRead st@(SocketTable _ _ r) socket n = do
     modifyMVar_ r (\v -> return (v + n))
+    onValidSocket st socket $ \slog ->
+        modifyMVar_ (socketTraffic slog) $ \(sent,recv) -> return (sent,recv+n)
 
-socketHasWritten (SocketTable _ w _) socket n =
+socketHasWritten st@(SocketTable _ w _) socket n = do
     modifyMVar_ w (\v -> return (v + n))
+    onValidSocket st socket $ \slog ->
+        modifyMVar_ (socketTraffic slog) $ \(sent,recv) -> return (sent+n,recv)
 
+-- | Dump global speed of the socket table and reset to 0
 socketDumpSpeed (SocketTable _ w r) = do
     modifyMVar r $ \rv -> do
         z <- modifyMVar w $ \wv -> return (0, wv)
